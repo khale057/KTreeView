@@ -1,7 +1,7 @@
 # Tool to visualize cell hierarchies as a tree map
 # Squarify treemap algorithm taken from: https://www.win.tue.nl/~vanwijk/stm.pdf
 # Author: kha.le
-import pygame, os, fileinput, random, math, pyperclip
+import pygame, os, random, math, pyperclip
 import tkinter as tk
 from tkinter import filedialog
 
@@ -111,8 +111,7 @@ class TreeNode:
 	- name: name of the cell (str)
 	- parent: reference to the parent TreeNode
 	- children: dict of references to the children TreeNodes
-	- ratios: a tuple of the format (displacement from left, displacement from top, width, height) where each item is between 0 and 1
-			  these are "position ratios" that store the position/size of each cell in a relative format to be flexible for any frame size
+	- ratio: PositionRatio object (see PositionRatio description above for more info)
 	"""
 	__slots__ = ('name', 'parent', 'children', 'ratio')
 	
@@ -389,7 +388,7 @@ def load_hierarchy(file_path):
 	Loads a hierarchy text file
 	This will update the topcell, build the tree, then display it
 	"""
-	global tree_root, topcell, cached_draw_instructions, current
+	global tree_root, topcell, cached_draw_instructions
 		
 	if os.path.exists(file_path):
 		cached_draw_instructions = {}
@@ -583,7 +582,7 @@ while running:
 				
 				# click the zoom out / reset expansion buttons
 				if current_shown_hierarchy:
-					if zoom_out_ref.collidepoint(event.pos):
+					if zoom_out_ref.collidepoint(event.pos) and topcell != current_shown_hierarchy:
 						one_hierarchy_up = '/'.join(current_shown_hierarchy.split('/')[:-1])
 						display_hierarchy(tree_root, one_hierarchy_up)
 					elif reset_tree_ref.collidepoint(event.pos):
