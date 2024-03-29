@@ -3,6 +3,7 @@
 # Author: kha.le
 import pygame, os, math, pyperclip, colorsys
 import tkinter as tk
+import numpy as np
 from collections import namedtuple, deque
 from datetime import datetime
 from tkinter import filedialog
@@ -18,7 +19,49 @@ RectFrame = namedtuple('RectFrame', ['x', 'y', 'width', 'height'])
 PositionRatio = namedtuple('PositionRatio', ['x', 'y', 'width', 'height'])
 RatioStep = namedtuple('RatioStep', ['node', 'reference_width', 'reference_height'])
 DrawStep = namedtuple('DrawStep', ['node', 'rect_frame'])
-CellRect = namedtuple('CellRect', ['full_path', 'rect'])
+CellRect = namedtuple('CellRect', ['full_path', 'x0', 'y0', 'x1', 'y1', 'instance_count', 'total_count', 'lower_lefts', 'rect'])
+
+class VectorSet:
+	"""
+	Data structure to store offset vector + four additional vectors pointing to the bounding box corners
+	"""
+	__slots__ = ('name', 'vector', 'bbox_vectors')
+	
+	def __init__(self, x_offset, y_offset):		
+		self.vector = np.array([x_offset, y_offset])
+		self.bbox_vectors = []
+		
+	def rotate(self, angle, only_bbox = False):
+		angle = angle * (np.pi / 180) # degrees to radians
+		rotation_matrix = np.array([[np.cos(angle), -np.sin(angle)],
+									[np.sin(angle), np.cos(angle)]])
+		
+		if not only_bbox: self.vector = np.dot(rotation_matrix, self.vector)
+		for index in range(len(self.bbox_vectors)):
+			self.bbox_vectors[index] = np.dot(rotation_matrix, self.bbox_vectors[index])
+
+	def mirror(self, mirror_factor, angle, only_bbox = False):
+		if mirror_factor != 1: return
+		
+		if not only_bbox: self.vector = np.array([self.vector[0], -self.vector[1]])
+		for index in range(len(self.bbox_vectors)):
+			self.bbox_vectors[index] = np.array([self.bbox_vectors[index][0], -self.bbox_vectors[index][1]])
+		
+	def magnify(self, scale_factor, only_bbox = False):
+		if not only_bbox: self.vector = self.vector * scale_factor
+		for index in range(len(self.bbox_vectors)):
+			self.bbox_vectors[index] = np.array(self.bbox_vectors[index]) * scale_factor
+			
+	def get_lower_left(self, name):				
+		x_list = []
+		y_list = []
+		for vector in self.bbox_vectors:
+			x_list.append(vector[0])
+			y_list.append(vector[1])
+		
+		x_lower_left = self.vector[0] + min(x_list)
+		y_lower_left = self.vector[1] + min(y_list)
+		return '{:.3f}'.format(x_lower_left).rstrip('0').rstrip('.') + ',' + '{:.3f}'.format(y_lower_left).rstrip('0').rstrip('.')
 
 class KTreeViewRunner:
 	"""
@@ -64,9 +107,11 @@ class KTreeViewRunner:
 		self.text_cache['black'] = {}
 		self.text_cache['white'] = {}
 		self.text_cache['tooltip'] = {}
-		self.text_cache['tooltip']['(Right-click to copy path)'] = pygame.font.SysFont('Arial', 11).render('(Right-click to copy path)', True, 'black')
-		self.text_cache['tooltip'][''] = pygame.font.SysFont('Arial', 11).render('', True, 'black')
+		self.text_cache['tooltip']['(Right-click to copy info)'] = pygame.font.SysFont('Arial', 13).render('(Right-click to copy info)', True, 'black')
+		self.text_cache['tooltip'][''] = pygame.font.SysFont('Arial', 13).render('', True, 'black')
+		self.text_cache['tooltip']['[Fullpath]'] = pygame.font.SysFont('Arial', 13).render('[Fullpath]', True, 'black')
 		self.tree_cache = {}
+		self.lower_left_cache = {}
 		
 		# recursion queues
 		self.ratio_queue = deque()
@@ -236,11 +281,20 @@ class KTreeViewRunner:
 				Its width will be 0.4 of the frame's width
 				Its height will be 0.8 of the frame's height
 		"""
-		__slots__ = ('name', 'parent', 'children', 'ratio')
+		__slots__ = ('name', 'parent', 'x0', 'y0', 'x1', 'y1', 'instance_count', 'total_count', 'lower_lefts', 'children', 'ratio')
 		
-		def __init__(self, name, parent=None):
+		def __init__(self, name, parent=None, x0='', y0='', x1='', y1='', instance_count='', total_count='', lower_lefts=''):
 			self.name = name
 			self.parent = parent		
+			
+			self.x0 = x0
+			self.y0 = y0
+			self.x1 = x1
+			self.y1 = y1
+			self.instance_count = str(max(1, int(instance_count))) if instance_count else instance_count
+			self.total_count = str(max(1, int(total_count))) if total_count else total_count
+			self.lower_lefts = lower_lefts
+			
 			self.children = {}
 			self.ratio = None
 		
@@ -283,9 +337,185 @@ class KTreeViewRunner:
 			for child in node.children.values():
 				result += self.print_tree(child, level+1)
 			return result
+		
+		def get_hierarchical_count(self):
+			if self.parent.name == '': return '1'
+			if not self.instance_count: return self.instance_count
+			return str(int(self.instance_count) * int(self.parent.get_hierarchical_count()))
+		
+		def get_lower_left(self):
+			"""
+			Returns a string representing current node's lower-left coordinates
+			String is in the form X0,Y0@X1,Y1@X2,Y2@... where each coordinate is separated by @ symbols
+			"""
+				
+			current_node = self.parent
 			
+			references = []
+			if self.lower_lefts == '':
+				return ''
+			parts = self.lower_lefts.split('@')
+			
+			# collect self's vectors
+			for part in parts:
+				part_split = part.split(',')
+				if len(part_split) == 5: # singular
+					x_offset, y_offset, mirror, angle, mag = [float(item) for item in part_split]
+					
+					current_vector_set = VectorSet(x_offset, y_offset)
+					
+					current_vector_set.bbox_vectors.append(np.array([float(self.x0), float(self.y0)]))
+					current_vector_set.bbox_vectors.append(np.array([float(self.x1), float(self.y0)]))
+					current_vector_set.bbox_vectors.append(np.array([float(self.x0), float(self.y1)]))
+					current_vector_set.bbox_vectors.append(np.array([float(self.x1), float(self.y1)]))
+					
+					current_vector_set.mirror(mirror, angle, only_bbox=True)
+					current_vector_set.rotate(angle, only_bbox=True)
+					current_vector_set.magnify(mag, only_bbox=True)
+					
+					references.append(current_vector_set)
+				elif len(part_split) == 9: # array
+					x_offset, y_offset, mirror, angle, mag, cols, rows, xspace, yspace = [float(item) for item in part_split]
+					
+					# setup new xspace / yspace dependent on mirror/angle/mag
+					array_vector = np.array([xspace, yspace])		
+					
+					if mirror == 1: # mirror
+						array_vector = np.array([array_vector[0], -array_vector[1]])
+							
+					angle_in_radians = angle * np.pi / 180
+					rotation_matrix = np.array([[np.cos(angle_in_radians), -np.sin(angle_in_radians)],
+												[np.sin(angle_in_radians), np.cos(angle_in_radians)]])
+					array_vector = np.dot(rotation_matrix, array_vector) # rotation
+					array_vector = array_vector * mag # mag
+					
+					
+					new_xspace = array_vector[0]
+					new_yspace = array_vector[1]
+					
+					array_vectors = []
+					
+					# first generate a list of vectors for the entire array
+					for col in range(int(cols)):
+						for row in range(int(rows)):
+						
+							current_vector_set = VectorSet(x_offset+new_xspace*col, y_offset+new_yspace*row)
+							
+							current_vector_set.bbox_vectors.append(np.array([float(self.x0), float(self.y0)]))
+							current_vector_set.bbox_vectors.append(np.array([float(self.x1), float(self.y0)]))
+							current_vector_set.bbox_vectors.append(np.array([float(self.x0), float(self.y1)]))
+							current_vector_set.bbox_vectors.append(np.array([float(self.x1), float(self.y1)]))
+							
+							current_vector_set.mirror(mirror, angle, only_bbox=True)
+							current_vector_set.rotate(angle, only_bbox=True)
+							current_vector_set.magnify(mag, only_bbox=True)
+							
+							references.append(current_vector_set)
+					
+				else:
+					print('[WARNING] Invalid lower-left data found (' + part + ')')
+			
+			# accumulate parents' vectors
+			while current_node.name != '': 
+				parent_parts = current_node.lower_lefts.split('@')
+				new_references = []
+				
+				for part in parent_parts:
+					part_split = part.split(',')
+					if len(part_split) == 5: # singular
+					
+						x_offset, y_offset, mirror, angle, mag = [float(item) for item in part_split]					
+						
+						for reference in references:
+							reference_copy = VectorSet(reference.vector[0], reference.vector[1])
+							for bbox_vector in reference.bbox_vectors:
+								reference_copy.bbox_vectors.append(np.array([bbox_vector[0], bbox_vector[1]]))
+								
+							reference_copy.mirror(mirror, angle)
+							reference_copy.rotate(angle)
+							reference_copy.magnify(mag)
+							
+							reference_copy.vector = reference_copy.vector + np.array([x_offset, y_offset])
+							new_references.append(reference_copy)
+						
+					elif len(part_split) == 9: # array
+					
+						x_offset, y_offset, mirror, angle, mag, cols, rows, xspace, yspace = [float(item) for item in part_split]
+					
+						# setup new xspace / yspace dependent on mirror/angle/mag
+						array_vector = np.array([xspace, yspace])		
+						
+						if mirror == 1: # mirror
+							array_vector = np.array([array_vector[0], -array_vector[1]])
+								
+						angle_in_radians = angle * np.pi / 180
+						rotation_matrix = np.array([[np.cos(angle_in_radians), -np.sin(angle_in_radians)],
+													[np.sin(angle_in_radians), np.cos(angle_in_radians)]])
+						array_vector = np.dot(rotation_matrix, array_vector) # rotation
+						array_vector = array_vector * mag # mag
+						
+						
+						new_xspace = array_vector[0]
+						new_yspace = array_vector[1]
+						
+						array_vectors = []
+						
+						# first generate a list of vectors for the entire array
+						for col in range(int(cols)):
+							for row in range(int(rows)):
+							
+								for reference in references:
+									reference_copy = VectorSet(reference.vector[0], reference.vector[1])
+									for bbox_vector in reference.bbox_vectors:
+										reference_copy.bbox_vectors.append(np.array([bbox_vector[0], bbox_vector[1]]))
+										
+									reference_copy.mirror(mirror, angle)
+									reference_copy.rotate(angle)
+									reference_copy.magnify(mag)
+									
+									reference_copy.vector = reference_copy.vector + np.array([x_offset+new_xspace*col, y_offset+new_yspace*row])
+									new_references.append(reference_copy)
+						
+					else:
+						print('[WARNING] Invalid lower-left data found (' + part + ')')
+				
+				
+				references = new_references
+				current_node = current_node.parent
+			
+			references = [reference.get_lower_left(self.name.split('/')[-1]) for reference in references]
+			return '@'.join(references)
+		
 		def __str__(self):
 			return self.print_tree(self)
+	
+	def get_lower_lefts(self, full_path, verbose=False):
+	
+		if full_path not in self.lower_left_cache:		
+			current_node = self.tree_root
+			
+			parts = full_path.split('/')
+			for part in parts[1:]:
+				current_node = current_node.children[part]
+			
+			lower_left_string = current_node.get_lower_left()
+			self.lower_left_cache[full_path] = lower_left_string
+		
+		lower_left_string = self.lower_left_cache[full_path]
+		
+		if not verbose and len(lower_left_string) > 75:
+			return lower_left_string[:75] + '...'
+			
+		return lower_left_string
+		
+	def get_hierarchical_counts(self, full_path):
+		current_node = self.tree_root
+		
+		parts = full_path.split('/')
+		for part in parts[1:]:
+			current_node = current_node.children[part]
+		
+		return current_node.get_hierarchical_count()
 	
 	# ==================================
 	#    Drawing Nodes
@@ -329,8 +559,8 @@ class KTreeViewRunner:
 		hue = self.get_hue(node)
 		sat = self.get_sat(node)
 		val = 1
-		return self.hsv_to_rgb(hue, sat, val)
-	
+		return self.hsv_to_rgb(hue, sat, val), self.hsv_to_rgb(hue, sat+0.1, val)
+		
 	def get_display_name(self, full_path, frame_width, frame_height):
 		"""
 		Returns the cell name, shortened if too long to display
@@ -365,8 +595,8 @@ class KTreeViewRunner:
 		Also: Partitions the draw space into a grid and adds that node to that grid-space's collision check 
 		When checking for collisions, it will first check which grid-space it is in to reduce the amount of collision checks
 		"""
-		current_cell_rectangle = CellRect(node.get_full_path(), pygame.Rect(rect_frame.x, rect_frame.y, rect_frame.width, rect_frame.height))
-
+		current_cell_rectangle = CellRect(node.get_full_path(), node.x0, node.y0, node.x1, node.y1, node.instance_count, node.total_count, node.lower_lefts, pygame.Rect(rect_frame.x, rect_frame.y, rect_frame.width, rect_frame.height))
+		
 		# spatial partitioning
 		for row in range(self.spatial_partition_size):
 			for col in range(self.spatial_partition_size):
@@ -389,9 +619,9 @@ class KTreeViewRunner:
 			self.progress_bar_current += 1
 			if self.progress_bar_current % 50 == 0: self.update_progress_bar('Drawing: ')
 		else:
-			color = self.get_color(node)
+			color, outline = self.get_color(node)
 			pygame.draw.rect(self.tree_cache[self.current_shown_hierarchy]['surface'], color, current_cell_rectangle.rect)			
-			pygame.draw.rect(self.tree_cache[self.current_shown_hierarchy]['surface'], color, current_cell_rectangle.rect, 2)
+			pygame.draw.rect(self.tree_cache[self.current_shown_hierarchy]['surface'], outline, current_cell_rectangle.rect, 2)
 			
 			self.draw_node_name(node.get_full_path(), 'black', rect_frame)
 		
@@ -557,11 +787,15 @@ class KTreeViewRunner:
 		while len(self.draw_queue) > 0:
 			step = self.draw_queue.popleft()
 			self.draw_node(step.node, step.rect_frame)
-		
+				
+		current_hierarchy_rect = pygame.Rect(12, 282, 200, 50)		
+		current_hierarchy_text_surface = pygame.font.SysFont('Arial', 12).render('[' + self.current_shown_hierarchy + ']', True, 'black')
+		self.tree_cache[self.current_shown_hierarchy]['surface'].blit(current_hierarchy_text_surface, current_hierarchy_rect)
+				
 		self.surfaces['tree'] = self.tree_cache[self.current_shown_hierarchy]['surface']
 		self.surfaces['text'] = self.tree_cache[self.current_shown_hierarchy]['text']
 		self.cell_rects = self.tree_cache[self.current_shown_hierarchy]['rects']
-		
+	
 	def add_hierarchy_to_tree(self, node, hierarchy):
 		"""
 		Adds a hierarchy to the root tree object
@@ -573,10 +807,23 @@ class KTreeViewRunner:
 		
 		parts = hierarchy.split('/')
 		for part in parts[1:]:
-			part = part.rstrip('\n')
-			if part not in current_node.children:
-				current_node.add_child(self.TreeNode(part, current_node))
-			current_node = current_node.children[part]
+			part = part.rstrip('\n').split('|')
+			if part[0] not in current_node.children:
+				if len(part) == 1: # without properties
+					current_node.add_child(self.TreeNode(part[0], current_node))
+				else:
+					current_node.add_child(self.TreeNode(
+						part[0], 
+						current_node, 
+						x0=part[1], 
+						y0=part[2], 
+						x1=part[3], 
+						y1=part[4],
+						instance_count=part[5],
+						total_count=part[6],
+						lower_lefts=part[7]
+					))
+			current_node = current_node.children[part[0]]
 
 	def build_tree_from_text(self, file_path):
 		"""
@@ -620,7 +867,9 @@ class KTreeViewRunner:
 		file_handler.close()
 		
 		if not top_cell: print('[WARNING] Top cell not found in hierarchy')
-		else: print('[Info] Top cell found: ' + str(top_cell))
+		else:
+			top_cell = top_cell.split('|')[0] # exclude properties
+			print('[Info] Top cell found: ' + str(top_cell))
 		
 		return top_cell
 
@@ -638,17 +887,18 @@ class KTreeViewRunner:
 			
 			self.update_progress_bar('Updating ratios...', empty=True)
 			self.ratio_queue.append(RatioStep(self.tree_root, self.screen_width, self.screen_height))
-		
+					
 			while len(self.ratio_queue) > 0:
 				step = self.ratio_queue.popleft()
 				self.update_ratio(step.node, step.reference_width, step.reference_height)
 			
 			self.tree_cache = {}
+			self.lower_left_cache = {}
 			self.display_hierarchy(self.tree_root, self.top_cell)
 			
 			for tree_button in [self.zoom_out_button, self.reset_tree_button, self.copy_shown_button]:
 				self.buttons_list.append(tree_button)
-			
+						
 			self.redraw_buttons()
 			
 	def open_file_browser(self):
@@ -773,7 +1023,7 @@ class KTreeViewRunner:
 		fraction_complete = str(self.progress_bar_current) + '/' + str(self.progress_bar_total)
 		if empty: fraction_complete = ''
 		
-		text_surface =  pygame.font.SysFont('Arial', 12).render(text + fraction_complete, True, 'black')
+		text_surface = pygame.font.SysFont('Arial', 12).render(text + fraction_complete, True, 'black')
 		blit_reference = self.screen.blit(text_surface, bar_text)
 		
 		pygame.display.update([bar_background, bar, bar_text, blit_reference])
@@ -849,8 +1099,25 @@ class KTreeViewRunner:
 				
 				elif event.button == 3: # RMB
 					if self.mouse_down != None and self.mouse_down.rect.collidepoint(event.pos):
-						pyperclip.copy(self.mouse_down.full_path)
-						print(self.mouse_down.full_path)
+						try:
+							width = float(self.mouse_down.x1) - float(self.mouse_down.x0)
+							height = float(self.mouse_down.y1) - float(self.mouse_down.y0)
+							area = '{:.3f}'.format(width*height).rstrip('0').rstrip('.')
+							width = '{:.3f}'.format(width).rstrip('0').rstrip('.')
+							height = '{:.3f}'.format(height).rstrip('0').rstrip('.')
+						except:
+							width = 'Not found.'
+							height = 'Not found.'
+							area = 'Not found.'
+												
+						copy_message = []
+						copy_message.append('Width/Height/Area (um): ' + width + '/' + height + '/' + area)
+						copy_message.append('Count: ' + self.mouse_down.instance_count + ' (Total: ' + self.mouse_down.total_count + ')')
+						copy_message.append('Full-path: ' + self.mouse_down.full_path)
+						copy_message.append('Lower-lefts:\n' + '\n'.join(self.get_lower_lefts(self.mouse_down.full_path, verbose=True).split('@')))
+						copy_message = '\n'.join(copy_message)
+						pyperclip.copy(copy_message)
+						print('Right-clicked [' + self.mouse_down.full_path + ']')
 							
 			# resizing window
 			if event.type == pygame.VIDEORESIZE: 
@@ -902,7 +1169,7 @@ class KTreeViewRunner:
 				
 				if hover: 
 					pygame.draw.rect(self.surfaces['hover'], self.colors['cell_outline'], cell_rect.rect, 2)
-					self.tooltip = cell_rect.full_path
+					self.tooltip = '|'.join([cell_rect.full_path, cell_rect.x0, cell_rect.y0, cell_rect.x1, cell_rect.y1, cell_rect.instance_count, self.get_hierarchical_counts(cell_rect.full_path), cell_rect.total_count, self.get_lower_lefts(cell_rect.full_path)])
 					self.mouse_down = cell_rect
 				
 		self.cell_hover['last_within_frame'] = within_frame
@@ -922,30 +1189,55 @@ class KTreeViewRunner:
 			text_surfaces = []
 					
 			# cell paths
-			if '/' in self.tooltip:
-				text_surfaces.append(self.text_cache['tooltip']['(Right-click to copy path)'])
+			if '|' in self.tooltip:
+				text_surfaces.append(self.text_cache['tooltip']['(Right-click to copy info)'])
 				text_surfaces.append(self.text_cache['tooltip'][''])
-			
+				full_path, x0, y0, x1, y1, instance_count, hierarchical_count, total_count, lower_lefts = self.tooltip.split('|')
+				
+				try:
+					width = float(x1) - float(x0)
+					height = float(y1) - float(y0)
+					area = '{:.3f}'.format(float(width)*float(height)).rstrip('0').rstrip('.')
+					width = '{:.3f}'.format(width).rstrip('0').rstrip('.')
+					height = '{:.3f}'.format(height).rstrip('0').rstrip('.')
+				except:
+					width = ''
+					height = ''
+					area = ''
+					
+				for prop, prop_name in zip([width + ' / ' + height + ' / ' + area, instance_count + ' (Hierarchy: ' + hierarchical_count + ' / Total: ' + total_count + ')', lower_lefts], ['W/H/A (um)', 'Count', 'Lower-lefts']):
+					if not prop or prop == ' /  / ' or prop == ' (Hierarchy:  / Total: )': continue
+					prop_text = prop_name + ': ' + prop
+					if prop_text not in self.text_cache['tooltip']:
+						self.text_cache['tooltip'][prop_text] = pygame.font.SysFont('Arial', 13).render(prop_text, True, 'black')
+					text_surfaces.append(self.text_cache['tooltip'][prop_text])
+				
+				missing_dimension = width == '' or height == '' or area == ''
+				missing_count = instance_count == '' or total_count == ''
+				
+				if not missing_dimension and not missing_count: text_surfaces.append(self.text_cache['tooltip'][''])
+				text_surfaces.append(self.text_cache['tooltip']['[Fullpath]'])
+				
 				# convert '/Chip/Tower/Transistor/' to ['/Chip/', 'Tower/', 'Transistor']
-				parts = self.tooltip.split('/')[1:]
+				parts = full_path.split('/')[1:]
 				parts = [part + '/' for part in parts]
 				parts[0] = '/' + parts[0]
 				parts[-1] = parts[-1][:-1]
 				
 				for text in parts:
 					if text not in self.text_cache['tooltip']:
-						self.text_cache['tooltip'][text] = pygame.font.SysFont('Arial', 11).render(text, True, 'black')
+						self.text_cache['tooltip'][text] = pygame.font.SysFont('Arial', 13).render(text, True, 'black')
 					text_surfaces.append(self.text_cache['tooltip'][text])
 
 			# normal button tool tips
 			else:
 				if self.tooltip not in self.text_cache['tooltip']:
-					self.text_cache['tooltip'][self.tooltip] = pygame.font.SysFont('Arial', 11).render(self.tooltip, True, 'black')
+					self.text_cache['tooltip'][self.tooltip] = pygame.font.SysFont('Arial', 13).render(self.tooltip, True, 'black')
 				text_surfaces.append(self.text_cache['tooltip'][self.tooltip])
 
 			self.tooltip_display_width = max([text_surface.get_size()[0] for text_surface in text_surfaces])
 			self.tooltip_line_count = len(text_surfaces) 
-			tooltip_rect = pygame.Rect(0, 0, self.tooltip_display_width+12, 7+13*len(text_surfaces))
+			tooltip_rect = pygame.Rect(0, 0, self.tooltip_display_width+12, 10+13*len(text_surfaces))
 			
 			pygame.draw.rect(self.surfaces['tooltip'], self.colors['tooltip']['color'], tooltip_rect)
 			pygame.draw.rect(self.surfaces['tooltip'], self.colors['tooltip']['outline'], tooltip_rect, 2)
